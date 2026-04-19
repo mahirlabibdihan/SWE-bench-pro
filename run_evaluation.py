@@ -211,7 +211,7 @@ def create_entryscript(sample):
 cd /app
 git reset --hard {base_commit}
 git checkout {base_commit}
-git apply -v /workspace/patch.diff
+git apply -v --reject /workspace/patch.diff
 {before_repo_set_cmd}
 # run test and save stdout and stderr to separate files
 bash /workspace/run_script.sh {selected_test_files_to_run} > /workspace/stdout.log 2> /workspace/stderr.log
@@ -458,7 +458,20 @@ def collect_outputs_local_container(container, instance_dir, uid, prefix):
     return output
 
 
-def eval_with_modal(patch, sample, output_dir, run_id, model_name, dockerhub_username, scripts_dir, prefix="", redo=False, block_network=False, docker_platform=None):
+def eval_with_modal(
+    patch,
+    sample,
+    output_dir,
+    run_id,
+    model_name,
+    dockerhub_username,
+    scripts_dir,
+    prefix="",
+    redo=False,
+    block_network=False,
+    docker_platform=None,
+    remove_image_after_eval=False,
+):
     if modal is None:
         raise RuntimeError("modal is not installed. Install it or run with --use_local_docker")
     uid = sample["instance_id"]
@@ -541,7 +554,20 @@ def eval_with_modal(patch, sample, output_dir, run_id, model_name, dockerhub_use
                 pass
 
 
-def eval_with_docker(patch, sample, output_dir, run_id, model_name, dockerhub_username, scripts_dir, prefix="", redo=False, block_network=False, docker_platform=None):
+def eval_with_docker(
+    patch,
+    sample,
+    output_dir,
+    run_id,
+    model_name,
+    dockerhub_username,
+    scripts_dir,
+    prefix="",
+    redo=False,
+    block_network=False,
+    docker_platform=None,
+    remove_image_after_eval=False,
+):
     if docker is None:
         raise RuntimeError("docker SDK is not installed. Install via 'pip install docker' or run without --use_local_docker")
     uid = sample["instance_id"]
@@ -553,6 +579,7 @@ def eval_with_docker(patch, sample, output_dir, run_id, model_name, dockerhub_us
     # print(f"Running local-docker evaluation for {uid}")
 
     container = None
+    dockerhub_image_uri = None
     try:
         try:
             files, entryscript_content = assemble_workspace_files(uid, scripts_dir, patch, sample)
@@ -630,6 +657,13 @@ def eval_with_docker(patch, sample, output_dir, run_id, model_name, dockerhub_us
                 container.remove(force=True)
             except Exception:
                 pass
+        if remove_image_after_eval and dockerhub_image_uri:
+            try:
+                client = docker.from_env()
+                client.images.remove(dockerhub_image_uri, force=True)
+                print(f"Removed Docker image: {dockerhub_image_uri}")
+            except Exception as e:
+                print(f"Warning: failed to remove Docker image {dockerhub_image_uri}: {e}")
 
 
 def parse_args():
@@ -651,10 +685,10 @@ def parse_args():
         help="Directory to write finalized run reports",
     )
     parser.add_argument(
-        "--dockerhub_username", required=True, help="Docker Hub username where sweap-images repository is located"
+        "--dockerhub_username", required=True, help="Docker Hub username where sweap-images repository is located", default="jefzda"
     )
     parser.add_argument(
-        "--scripts_dir", required=True, help="Directory containing local run scripts (e.g., scripts/run_scripts)"
+        "--scripts_dir", required=True, help="Directory containing local run scripts (e.g., scripts/run_scripts)", default="swebenchpro/run_scripts"
     )
     parser.add_argument(
         "--use_local_docker", action="store_true", help="Run locally with Docker instead of Modal"
@@ -670,11 +704,16 @@ def parse_args():
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=50,
+        default=5,
         help="Number of workers to run evaluations in parallel",
     )
     parser.add_argument(
         "--block_network", action="store_true", help="Block network access inside container"
+    )
+    parser.add_argument(
+        "--remove_image_after_eval",
+        action="store_true",
+        help="Remove pulled Docker image after each local Docker evaluation to save disk space",
     )
     return parser.parse_args()
 
@@ -708,7 +747,7 @@ def build_run_style_report(raw_sample_df, patches_to_run, patch_statuses, eval_r
         "error_ids": sorted(error_ids),
         "schema_version": 2,
         # Keep per-instance booleans available for downstream consumers.
-        "instance_results": eval_results,
+        # "instance_results": eval_results,
     }
 
 
@@ -823,6 +862,7 @@ def main():
                 redo=args.redo,
                 block_network=args.block_network,
                 docker_platform=(args.docker_platform or detected_platform) if args.use_local_docker else None,
+                remove_image_after_eval=args.remove_image_after_eval,
             ): patch_sample
             for patch_sample, patch_text in valid_patches
         }
