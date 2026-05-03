@@ -1,11 +1,11 @@
-"""
-The script is used to evaluate the performance of the SWEAP Pro agent with Modal.
+"""The script evaluates the performance of the SWEAP Pro agent using local Docker.
 
 This evaluation script:
 1. Takes a Hugging Face dataset and a JSON file containing patches
-2. Runs each patch in a Modal sandbox environment using Docker Hub images
-3. Executes the tests using local run scripts and collects results
-4. Calculates overall accuracy based on test pass/fail status
+2. Pre-fetches all required Docker images serially
+3. Runs each patch in a Docker container environment using Docker Hub images
+4. Executes the tests using local run scripts and collects results
+5. Calculates overall accuracy based on test pass/fail status
 
 Usage:
 python swe_bench_pro_eval.py \
@@ -16,7 +16,7 @@ python swe_bench_pro_eval.py \
     --scripts_dir=run_scripts \
     --num_workers=5 \
     --dockerhub_username=jefzda \
-    --use_local_docker
+    --use_local_docker 
 
 The dataset must have columns: instance_id, before_repo_set_cmd, selected_test_files_to_run, 
   base_commit, base_dockerfile, instance_dockerfile, fail_to_pass, pass_to_pass
@@ -37,24 +37,47 @@ import platform as py_platform
 import re
 import tarfile
 import tempfile
-from pathlib import Path
+import threading
+import time
+from pathlib import Path, PurePosixPath
 
-try:
-    import modal  # Lazy/optional: only required when not using --use_local_docker
-except Exception:
-    modal = None
-try:
-    import docker  # Optional: used when --use_local_docker is set
-except Exception:
-    docker = None
+import docker
 import pandas as pd
 from tqdm import tqdm
 from datasets import load_dataset
+from rich.console import Console
 
+from swebench.harness.docker_utils import (
+    cleanup_container,
+    copy_to_container,
+    exec_run_with_timeout,
+    remove_image,
+)
 from swebenchpro.helper_code.image_uri import get_dockerhub_image_uri
 
 
 RUN_EVALUATION_LOG_DIR = Path("logs/run_evaluation")
+
+console = Console()
+
+
+def cprint(message="", style=None, end="\n"):
+    console.print(message, style=style, end=end, highlight=False)
+
+
+def clog(message):
+    console.log(message)
+
+
+def cstream(message, end=""):
+    console.print(message, end=end, markup=False, highlight=False, soft_wrap=True)
+
+
+def vprint(verbose, message):
+    if not verbose:
+        return
+    thread_name = threading.current_thread().name
+    clog(f"[verbose][{thread_name}] {message}")
 
 
 def normalize_model_name(model_name):
@@ -260,7 +283,7 @@ def prepare_run(instance_dir, prefix, redo):
     os.makedirs(instance_dir, exist_ok=True)
     output_path = os.path.join(instance_dir, f"{prefix}_output.json")
     if not redo and os.path.exists(output_path):
-        print(f"Skipping {instance_dir} - output already exists")
+        cprint(f"Skipping {instance_dir} - output already exists", style="yellow")
         with open(output_path, "r") as f:
             return json.load(f), output_path, tempfile.mkdtemp()
     # Create workspace in a temporary directory instead of in logs
@@ -286,7 +309,7 @@ def assemble_workspace_files(uid, scripts_dir, patch, sample):
 
     cleaned_patch = strip_binary_hunks(patch)
     if cleaned_patch != patch:
-        print(f"Stripped binary diff hunks from patch for {uid}")
+        cprint(f"Stripped binary diff hunks from patch for {uid}", style="yellow")
 
     files = {
         "patch.diff": cleaned_patch,
@@ -297,38 +320,18 @@ def assemble_workspace_files(uid, scripts_dir, patch, sample):
     return files, entryscript_content
 
 
-def write_files_modal(sandbox, files):
-    for rel_path, content in files.items():
-        with sandbox.open(f"/workspace/{rel_path}", "w") as f:
-            f.write(content)
-
-
-def write_files_local(workspace_dir, files):
-    for rel_path, content in files.items():
-        dst = os.path.join(workspace_dir, rel_path)
-        with open(dst, "w") as f:
-            f.write(content)
-
-
-def _create_workspace_tar(files):
-    """Create a tar archive (bytes) for workspace files to upload into a container."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tar:
-        for rel_path, content in files.items():
-            data = content.encode("utf-8")
-            info = tarfile.TarInfo(name=rel_path)
-            info.size = len(data)
-            info.mode = 0o644
-            tar.addfile(info, io.BytesIO(data))
-    buf.seek(0)
-    return buf.read()
 
 
 def write_files_to_container(container, files):
-    """Write workspace files directly into /workspace inside a running container."""
+    """Write workspace files into /workspace using swebench harness copy helper."""
     container.exec_run("mkdir -p /workspace")
-    tar_data = _create_workspace_tar(files)
-    container.put_archive("/workspace", tar_data)
+    with tempfile.TemporaryDirectory(prefix="swebenchpro_workspace_files_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        for rel_path, content in files.items():
+            local_file = tmp_path / rel_path
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            local_file.write_text(content)
+            copy_to_container(container, local_file, PurePosixPath(f"/workspace/{rel_path}"))
 
 
 def _read_container_file(container, file_path):
@@ -349,86 +352,10 @@ def _read_container_file(container, file_path):
         return file_obj.read().decode("utf-8", errors="replace")
 
 
-def exec_and_stream_container_command(container, cmd, uid=""):
-    """Execute a command in a running container and stream stdout/stderr to host console."""
-    exec_id = container.client.api.exec_create(container.id, cmd)["Id"]
-    prefix = f"[{uid}] " if uid else ""
-    print(f"{prefix}Running: {cmd}")
-
-    stream = container.client.api.exec_start(exec_id, stream=True, demux=True)
-    for stdout_chunk, stderr_chunk in stream:
-        if stdout_chunk:
-            print(f"{prefix}{stdout_chunk.decode('utf-8', errors='replace')}", end="")
-        if stderr_chunk:
-            print(f"{prefix}{stderr_chunk.decode('utf-8', errors='replace')}", end="")
-
-    inspect_data = container.client.api.exec_inspect(exec_id)
-    return inspect_data.get("ExitCode", 1)
-
-
 def save_entryscript_copy(instance_dir, prefix, entryscript_content):
     with open(os.path.join(instance_dir, f"{prefix}_entryscript.sh"), "w") as f:
         f.write(entryscript_content if entryscript_content is not None else "")
 
-
-def collect_outputs_modal(sandbox, instance_dir, uid, prefix):
-    # Save logs first (best-effort)
-    try:
-        with sandbox.open("/workspace/stdout.log", "r") as f_in:
-            with open(os.path.join(instance_dir, f"{prefix}_stdout.log"), "w") as f:
-                stdout_content = f_in.read()
-                f.write(stdout_content if stdout_content is not None else "")
-    except FileNotFoundError:
-        pass
-    try:
-        with sandbox.open("/workspace/stderr.log", "r") as f_in:
-            with open(os.path.join(instance_dir, f"{prefix}_stderr.log"), "w") as f:
-                stderr_content = f_in.read()
-                f.write(stderr_content if stderr_content is not None else "")
-    except FileNotFoundError:
-        pass
-
-    # Then try to read output.json
-    try:
-        with sandbox.open("/workspace/output.json", "r") as f_in:
-            output = json.load(f_in)
-            with open(os.path.join(instance_dir, f"{prefix}_output.json"), "w") as f:
-                json.dump(output, f)
-            return output
-    except FileNotFoundError:
-        print(
-            f"Warning: output.json not found for {uid}. Check {prefix}_stdout.log and {prefix}_stderr.log for details"
-        )
-        return None
-
-
-def collect_outputs_local(workspace_dir, instance_dir, uid, prefix):
-    def _copy_safe(src_name, dest_name):
-        src_path = os.path.join(workspace_dir, src_name)
-        dest_path = os.path.join(instance_dir, dest_name)
-        try:
-            with open(src_path, "r") as f_in:
-                content = f_in.read()
-        except FileNotFoundError:
-            content = ""
-        with open(dest_path, "w") as f_out:
-            f_out.write(content if content is not None else "")
-
-    _copy_safe("stdout.log", f"{prefix}_stdout.log")
-    _copy_safe("stderr.log", f"{prefix}_stderr.log")
-
-    # Then try to read output.json
-    try:
-        with open(os.path.join(workspace_dir, "output.json"), "r") as f_in:
-            output = json.load(f_in)
-            with open(os.path.join(instance_dir, f"{prefix}_output.json"), "w") as f:
-                json.dump(output, f)
-            return output
-    except FileNotFoundError:
-        print(
-            f"Warning: output.json not found for {uid}. Check {prefix}_stdout.log and {prefix}_stderr.log for details"
-        )
-        return None
 
 
 def collect_outputs_local_container(container, instance_dir, uid, prefix):
@@ -442,15 +369,16 @@ def collect_outputs_local_container(container, instance_dir, uid, prefix):
 
     output_json_text = _read_container_file(container, "/workspace/output.json")
     if output_json_text is None:
-        print(
-            f"Warning: output.json not found for {uid}. Check {prefix}_stdout.log and {prefix}_stderr.log for details"
+        cprint(
+            f"Warning: output.json not found for {uid}. Check {prefix}_stdout.log and {prefix}_stderr.log for details",
+            style="yellow",
         )
         return None
 
     try:
         output = json.loads(output_json_text)
     except json.JSONDecodeError as exc:
-        print(f"Warning: Failed to parse output.json for {uid}: {exc}")
+        cprint(f"Warning: Failed to parse output.json for {uid}: {exc}", style="yellow")
         return None
 
     with open(os.path.join(instance_dir, f"{prefix}_output.json"), "w") as f:
@@ -458,100 +386,75 @@ def collect_outputs_local_container(container, instance_dir, uid, prefix):
     return output
 
 
-def eval_with_modal(
-    patch,
-    sample,
-    output_dir,
-    run_id,
-    model_name,
+
+
+
+def preflight_pull_images_serial(
+    valid_patches,
+    raw_sample_df,
     dockerhub_username,
-    scripts_dir,
-    prefix="",
-    redo=False,
-    block_network=False,
     docker_platform=None,
-    remove_image_after_eval=False,
+    verbose=False,
+    docker_api_timeout_seconds=120,
 ):
-    if modal is None:
-        raise RuntimeError("modal is not installed. Install it or run with --use_local_docker")
-    uid = sample["instance_id"]
-    instance_dir = get_instance_output_dir(output_dir, run_id, model_name, uid)
-    existing_output, output_path, workspace_dir = prepare_run(instance_dir, prefix, redo)
-    if existing_output is not None:
-        return existing_output
-
-    sandbox = None
+    """
+    Pre-fetch all required Docker images serially before starting parallel execution.
+    This avoids network contention and rate-limiting issues during threaded pulls.
     
-    print(f"Running evaluation for {uid}")
+    Args:
+        valid_patches (list): List of (patch_sample, patch_text) tuples
+        raw_sample_df (pd.DataFrame): Dataset rows indexed by instance_id
+        dockerhub_username (str): Docker Hub username for images
+        docker_platform (str): Optional platform override (e.g., linux/amd64)
+        verbose (bool): If True, print per-image pull logs
+    """
+    unique_images = set()
+    vprint(verbose, f"Starting preflight image discovery for {len(valid_patches)} runnable patches")
+    for patch_sample, _ in valid_patches:
+        uid = patch_sample["instance_id"]
+        sample_repo = raw_sample_df.loc[uid].get("repo", "")
+        image_uri = get_dockerhub_image_uri(uid, dockerhub_username, sample_repo)
+        unique_images.add((image_uri, docker_platform))
+    
+    if not unique_images:
+        vprint(verbose, "No images to prefetch; skipping preflight pull phase")
+        return
+    
+    vprint(verbose, "Creating Docker client for preflight pulls")
     try:
-        write_patch_snapshot(instance_dir, prefix, patch)
-
-        try:
-            files, entryscript_content = assemble_workspace_files(uid, scripts_dir, patch, sample)
-        except FileNotFoundError as e:
-            print(f"Error loading scripts for {uid}: {e}")
-            return None
-
-        # Save run script to log directory for reference
-        save_runscript_to_log(instance_dir, prefix, files["run_script.sh"])
-
-        app = modal.App.lookup(name="swe-bench-pro-eval", create_if_missing=True)
-        
-        # Use Docker Hub image instead of ECR
-        dockerhub_image_uri = get_dockerhub_image_uri(uid, dockerhub_username, sample.get("repo", ""))
-        # print(f"Using Docker Hub image: {dockerhub_image_uri}")
-        
-        image = modal.Image.from_registry(
-            dockerhub_image_uri
-        )
-
-        sandbox = modal.Sandbox.create(
-            image=image,
-            app=app,
-            timeout=60 * 60,
-            cpu=(1, 4),
-            memory=(5 * 1024, 30 * 1024),
-            block_network=block_network,
-        )
-        
-        process = sandbox.exec("mkdir", "-p", "/workspace")
-        process.wait()
-        
-        write_files_modal(sandbox, files)
-            
-        process = sandbox.exec("bash", "/workspace/entryscript.sh")
-        process.wait()
-        
-        # Check if the process was successful
-        if process.returncode != 0:
-            print(f"Entryscript failed for {uid} with return code: {process.returncode}")
-            # Get stderr from the process directly (note: this may not work with all Modal versions)
-            try:
-                stderr_content = getattr(process, 'stderr', None)
-                if stderr_content and hasattr(stderr_content, 'read'):
-                    error_details = stderr_content.read()
-                    if error_details:
-                        print(f"Error details for {uid}:")
-                        print(error_details[:1000])  # Print first 1000 chars
-            except Exception as e:
-                print(f"Failed to read stderr for {uid}: {e}")
-            
-        output = collect_outputs_modal(sandbox, instance_dir, uid, prefix)
-        if output is None:
-            return None
-        save_entryscript_copy(instance_dir, prefix, entryscript_content)
-            
-        return output
+        client = docker.from_env(timeout=int(docker_api_timeout_seconds))
     except Exception as e:
-        print(f"Error in eval_with_modal for {uid}: {repr(e)}")
-        print(f"Error type: {type(e)}")
-        return None
-    finally:
-        if sandbox:
+        cprint(f"Error creating Docker client for preflight pulls: {e}", style="red")
+        return
+    
+    cprint(f"Pre-fetching {len(unique_images)} Docker images serially...", style="cyan")
+    
+    for idx, (image_uri, platform) in enumerate(unique_images, 1):
+        try:
+            if verbose:
+                cprint(f"  [{idx}/{len(unique_images)}] Pulling {image_uri}...", end="")
+            start_time = time.monotonic()
+            if platform:
+                client.images.pull(image_uri, platform=platform)
+            else:
+                client.images.pull(image_uri)
+            if verbose:
+                cprint(" OK", style="green")
+            vprint(verbose, f"Prefetch success for {image_uri} in {time.monotonic() - start_time:.2f}s")
+        except Exception as pull_err:
+            # Try to check if image exists locally
             try:
-                sandbox.terminate()
+                client.images.get(image_uri)
+                if verbose:
+                    cprint(" (already cached locally)", style="green")
+                vprint(verbose, f"Prefetch pull failed but local cache exists for {image_uri}")
             except Exception:
-                pass
+                if verbose:
+                    cprint(" FAILED", style="red")
+                cprint(f"  Warning: Failed to pull image {image_uri}: {pull_err}", style="yellow")
+                cprint("  Will attempt to use image during evaluation if available locally.", style="yellow")
+
+    vprint(verbose, "Completed preflight image pull phase")
 
 
 def eval_with_docker(
@@ -567,49 +470,75 @@ def eval_with_docker(
     block_network=False,
     docker_platform=None,
     remove_image_after_eval=False,
+    skip_pull=False,
+    verbose=False,
+    entryscript_timeout_seconds=1800,
+    docker_api_timeout_seconds=120,
 ):
     if docker is None:
         raise RuntimeError("docker SDK is not installed. Install via 'pip install docker' or run without --use_local_docker")
     uid = sample["instance_id"]
+    vprint(verbose, f"[{uid}] Starting eval_with_docker")
     instance_dir = get_instance_output_dir(output_dir, run_id, model_name, uid)
     existing_output, output_path, workspace_dir = prepare_run(instance_dir, prefix, redo)
     if existing_output is not None:
+        vprint(verbose, f"[{uid}] Reusing existing output from {output_path}")
         return existing_output
 
     # print(f"Running local-docker evaluation for {uid}")
 
     container = None
+    client = None
     dockerhub_image_uri = None
     try:
         try:
+            vprint(verbose, f"[{uid}] Assembling workspace files from scripts dir: {scripts_dir}")
             files, entryscript_content = assemble_workspace_files(uid, scripts_dir, patch, sample)
         except FileNotFoundError as e:
-            print(f"Error loading scripts for {uid}: {e}")
+            cprint(f"Error loading scripts for {uid}: {e}", style="red")
             return None
+        vprint(verbose, f"[{uid}] Writing patch snapshot to {instance_dir}")
         write_patch_snapshot(instance_dir, prefix, patch)
 
         # Save run script to log directory for reference
         save_runscript_to_log(instance_dir, prefix, files["run_script.sh"])
 
+        vprint(verbose, f"[{uid}] Extracting Docker ENV vars")
         env_vars = extract_dockerfile_env_vars(uid)
+        vprint(verbose, f"[{uid}] Extracted {len(env_vars)} env vars")
 
         # Run container via Docker SDK
         dockerhub_image_uri = get_dockerhub_image_uri(uid, dockerhub_username, sample.get("repo", ""))
-        # print(f"Using Docker Hub image: {dockerhub_image_uri}")
+        vprint(verbose, f"[{uid}] Resolved image URI: {dockerhub_image_uri}")
 
-        client = docker.from_env()
-        try:
-            if docker_platform:
-                client.images.pull(dockerhub_image_uri, platform=docker_platform)
-            else:
-                client.images.pull(dockerhub_image_uri)
-        except Exception as pull_err:
-            # If pull fails, fall back to a local image if present; otherwise, fail this run
+        vprint(verbose, f"[{uid}] Creating Docker client")
+        client = docker.from_env(timeout=int(docker_api_timeout_seconds))
+        if not skip_pull:
             try:
+                pull_start = time.monotonic()
+                vprint(verbose, f"[{uid}] Pulling image (skip_pull=False)")
+                if docker_platform:
+                    client.images.pull(dockerhub_image_uri, platform=docker_platform)
+                else:
+                    client.images.pull(dockerhub_image_uri)
+                vprint(verbose, f"[{uid}] Pulled image in {time.monotonic() - pull_start:.2f}s")
+            except Exception as pull_err:
+                # If pull fails, fall back to a local image if present; otherwise, fail this run
+                try:
+                    client.images.get(dockerhub_image_uri)
+                    cprint(f"Using locally available image: {dockerhub_image_uri}", style="yellow")
+                    vprint(verbose, f"[{uid}] Pull failed; local image cache is available")
+                except Exception:
+                    cprint(f"Failed to pull or find image locally for {uid}: {pull_err}", style="red")
+                    return None
+        else:
+            # Image should already be cached from preflight phase
+            try:
+                vprint(verbose, f"[{uid}] Verifying pre-fetched image exists locally")
                 client.images.get(dockerhub_image_uri)
-                print(f"Using locally available image: {dockerhub_image_uri}")
+                vprint(verbose, f"[{uid}] Image exists locally")
             except Exception:
-                print(f"Failed to pull or find image locally for {uid}: {pull_err}")
+                cprint(f"Warning: Image {dockerhub_image_uri} not found locally for {uid}", style="yellow")
                 return None
 
         run_kwargs = {
@@ -625,49 +554,74 @@ def eval_with_docker(
         if docker_platform:
             run_kwargs["platform"] = docker_platform
 
+        vprint(verbose, f"[{uid}] Starting container")
+        container_start = time.monotonic()
         container = client.containers.run(dockerhub_image_uri, **run_kwargs)
+        vprint(verbose, f"[{uid}] Container started in {time.monotonic() - container_start:.2f}s")
 
+        vprint(verbose, f"[{uid}] Uploading workspace files to container")
         write_files_to_container(container, files)
-
-        # status_code = exec_and_stream_container_command(
-        #     container,
-        #     "bash /workspace/entryscript.sh",
-        #     uid=uid,
-        # )
+        vprint(verbose, f"[{uid}] Workspace upload complete")
         
-        exec_result = container.exec_run("bash /workspace/entryscript.sh")
-        status_code = exec_result.exit_code
+        entryscript_cmd = "bash /workspace/entryscript.sh"
+        vprint(
+            verbose,
+            f"[{uid}] Running entryscript via harness exec_run_with_timeout (timeout={int(entryscript_timeout_seconds)}s)",
+        )
+        test_output, timed_out, total_runtime = exec_run_with_timeout(
+            container,
+            entryscript_cmd,
+            timeout=int(entryscript_timeout_seconds),
+        )
+        vprint(verbose, f"[{uid}] Entryscript runtime: {total_runtime:.2f}s")
+        if verbose and test_output:
+            cstream(test_output)
 
-        if status_code != 0:
-            print(f"Entryscript failed for {uid} with return code: {status_code}")
+        if timed_out:
+            cprint(
+                f"Entryscript timed out for {uid} after {int(entryscript_timeout_seconds)}s",
+                style="red",
+            )
+            return None
         # Collect outputs and logs, and save entryscript for reference
+        vprint(verbose, f"[{uid}] Collecting output artifacts")
         output = collect_outputs_local_container(container, instance_dir, uid, prefix)
         if output is None:
+            vprint(verbose, f"[{uid}] Output collection returned None")
             return None
         save_entryscript_copy(instance_dir, prefix, entryscript_content)
+        vprint(verbose, f"[{uid}] Evaluation completed successfully")
 
         return output
     except Exception as e:
-        print(f"Error in eval_with_docker for {uid}: {repr(e)}")
-        print(f"Error type: {type(e)}")
+        cprint(f"Error in eval_with_docker for {uid}: {repr(e)}", style="red")
+        cprint(f"Error type: {type(e)}", style="red")
+        vprint(verbose, f"[{uid}] Exception path taken")
         return None
     finally:
+        vprint(verbose, f"[{uid}] Entering cleanup")
         if container is not None:
             try:
-                container.remove(force=True)
+                if client is None:
+                    client = docker.from_env()
+                cleanup_container(client, container, logger="quiet")
+                vprint(verbose, f"[{uid}] Container removed")
             except Exception:
+                vprint(verbose, f"[{uid}] Container removal failed")
                 pass
         if remove_image_after_eval and dockerhub_image_uri:
             try:
-                client = docker.from_env()
-                client.images.remove(dockerhub_image_uri, force=True)
-                print(f"Removed Docker image: {dockerhub_image_uri}")
+                client = docker.from_env(timeout=int(docker_api_timeout_seconds))
+                remove_image(client, dockerhub_image_uri, logger="quiet")
+                cprint(f"Removed Docker image: {dockerhub_image_uri}", style="yellow")
+                vprint(verbose, f"[{uid}] Image removed during cleanup")
             except Exception as e:
-                print(f"Warning: failed to remove Docker image {dockerhub_image_uri}: {e}")
+                cprint(f"Warning: failed to remove Docker image {dockerhub_image_uri}: {e}", style="yellow")
+        vprint(verbose, f"[{uid}] Cleanup complete")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run SWEAP Pro evaluations using Modal or local Docker with Docker Hub images and local scripts")
+    parser = argparse.ArgumentParser(description="Run SWEAP Pro evaluations using local Docker with Docker Hub images and local scripts")
     parser.add_argument(
         "-id",
         "--run_id",
@@ -681,17 +635,14 @@ def parse_args():
     parser.add_argument(
         "--report_dir",
         type=str,
-        default=".",
+        default="evaluation",
         help="Directory to write finalized run reports",
     )
     parser.add_argument(
-        "--dockerhub_username", required=True, help="Docker Hub username where sweap-images repository is located", default="jefzda"
+        "--dockerhub_username", help="Docker Hub username where sweap-images repository is located", default="jefzda"
     )
     parser.add_argument(
-        "--scripts_dir", required=True, help="Directory containing local run scripts (e.g., scripts/run_scripts)", default="swebenchpro/run_scripts"
-    )
-    parser.add_argument(
-        "--use_local_docker", action="store_true", help="Run locally with Docker instead of Modal"
+        "--scripts_dir", help="Directory containing local run scripts (e.g., scripts/run_scripts)", default="swebenchpro/run_scripts"
     )
     parser.add_argument(
         "--docker_platform",
@@ -704,7 +655,7 @@ def parse_args():
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=5,
+        default=1,
         help="Number of workers to run evaluations in parallel",
     )
     parser.add_argument(
@@ -714,6 +665,29 @@ def parse_args():
         "--remove_image_after_eval",
         action="store_true",
         help="Remove pulled Docker image after each local Docker evaluation to save disk space",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging (per-image pull logs and streamed container output)",
+    )
+    parser.add_argument(
+        "--heartbeat_seconds",
+        type=float,
+        default=30.0,
+        help="Heartbeat interval in seconds while waiting for worker completion",
+    )
+    parser.add_argument(
+        "--entryscript_timeout_seconds",
+        type=int,
+        default=1800,
+        help="Timeout in seconds for /workspace/entryscript.sh inside the container",
+    )
+    parser.add_argument(
+        "--docker_api_timeout_seconds",
+        type=int,
+        default=120,
+        help="Timeout in seconds for Docker SDK API calls (pull/get/run/remove)",
     )
     return parser.parse_args()
 
@@ -753,6 +727,8 @@ def build_run_style_report(raw_sample_df, patches_to_run, patch_statuses, eval_r
 
 def main():
     args = parse_args()
+    run_start = time.monotonic()
+    vprint(args.verbose, "Starting run_evaluation main()")
     if not args.run_id:
         raise ValueError("Run ID must be provided")
 
@@ -762,10 +738,14 @@ def main():
 
     report_dir = Path(args.report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
+    vprint(args.verbose, f"Run output dir: {run_output_dir}")
+    vprint(args.verbose, f"Report dir: {report_dir}")
 
     # Load dataset from Hugging Face
-    print(f"Loading dataset: {args.dataset_name}")
+    cprint(f"Loading dataset: {args.dataset_name}", style="cyan")
+    dataset_load_start = time.monotonic()
     dataset = load_dataset(args.dataset_name)
+    vprint(args.verbose, f"Dataset loaded in {time.monotonic() - dataset_load_start:.2f}s")
     
     # Handle different dataset splits (use 'test' if available, else 'train' or first split)
     if isinstance(dataset, dict):   
@@ -776,6 +756,7 @@ def main():
             dataset = dataset[list(dataset.keys())[0]]
     
     # Convert to DataFrame
+    vprint(args.verbose, "Converting dataset to pandas DataFrame")
     raw_sample_df = dataset.to_pandas()
     
     # Replace nulls with empty strings
@@ -785,9 +766,12 @@ def main():
     if 'instance_id' not in raw_sample_df.columns:
         raise ValueError("Dataset must contain 'instance_id' column")
     raw_sample_df = raw_sample_df.set_index("instance_id", drop=False)
+    vprint(args.verbose, f"Dataset rows available: {len(raw_sample_df)}")
 
     # Load patches from file (supports JSON/JSONL, dict/list formats)
+    vprint(args.verbose, f"Loading patches from {args.predictions_path}")
     patches_to_run = load_patches_from_file(args.predictions_path)
+    vprint(args.verbose, f"Loaded {len(patches_to_run)} patches")
     
     eval_results = {}
     patch_statuses = {}
@@ -818,41 +802,65 @@ def main():
 
         valid_patches.append((patch_sample, patch_text))
         # print(f"Found patch for instance_id: {instance_id}")
+
+    vprint(
+        args.verbose,
+        f"Patch filtering complete: runnable={len(valid_patches)}, missing={len(missing_instances)}, empty={status_counts['empty']}, pre-error={status_counts['error']}",
+    )
     
     if missing_instances:
-        print(f"Warning: Found {len(missing_instances)} patch instances not in raw sample data:")
+        cprint(f"Warning: Found {len(missing_instances)} patch instances not in raw sample data:", style="yellow")
         for missing_id in missing_instances[:5]:  # Show first 5
-            print(f"  - {missing_id}")
+            cprint(f"  - {missing_id}")
         if len(missing_instances) > 5:
-            print(f"  ... and {len(missing_instances) - 5} more")
+            cprint(f"  ... and {len(missing_instances) - 5} more")
 
     if status_counts["empty"] or status_counts["error"]:
-        print(
-            f"Skipping {status_counts['empty']} empty patches and {status_counts['error']} errored patches before execution"
+        cprint(
+            f"Skipping {status_counts['empty']} empty patches and {status_counts['error']} errored patches before execution",
+            style="yellow",
         )
 
-    print(f"Proceeding with {len(valid_patches)} runnable patches out of {len(patches_to_run)} total patches")
+    cprint(
+        f"Proceeding with {len(valid_patches)} runnable patches out of {len(patches_to_run)} total patches",
+        style="cyan",
+    )
 
-    # Select runtime
     # Auto-detect default platform if not provided: prefer linux/amd64 on Apple Silicon
     detected_platform = None
-    if args.use_local_docker and args.docker_platform is None:
+    if args.docker_platform is None:
         try:
             if py_platform.machine().lower() in {"arm64", "aarch64"}:
                 detected_platform = "linux/amd64"
         except Exception:
             detected_platform = None
 
-    eval_fn = eval_with_docker if args.use_local_docker else eval_with_modal
+    # Pre-fetch all Docker images serially
+    preflight_start = time.monotonic()
+    preflight_pull_images_serial(
+        valid_patches,
+        raw_sample_df,
+        args.dockerhub_username,
+        args.docker_platform or detected_platform,
+        verbose=args.verbose,
+        docker_api_timeout_seconds=args.docker_api_timeout_seconds,
+    )
+    vprint(args.verbose, f"Preflight phase finished in {time.monotonic() - preflight_start:.2f}s")
 
-    # Use ThreadPoolExecutor to run evaluations in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-        # Create a dictionary mapping futures to their patch samples for progress tracking
-        future_to_patch = {
-            executor.submit(
-                eval_fn,
+    # Run evaluations (serial if num_workers <= 1; threaded otherwise)
+    stats_lock = threading.Lock() if args.num_workers > 1 else None
+    pbar = tqdm(total=len(valid_patches), desc="Evaluation", postfix=status_counts)
+
+    def run_evaluation_with_progress(patch_sample, patch_text):
+        instance_id = patch_sample["instance_id"]
+        patch_status = "error"
+        instance_start = time.monotonic()
+        vprint(args.verbose, f"[{instance_id}] Worker started")
+
+        try:
+            output = eval_with_docker(
                 patch_text,
-                raw_sample_df.loc[patch_sample["instance_id"]],
+                raw_sample_df.loc[instance_id],
                 str(output_root),
                 args.run_id,
                 get_prediction_model_name(patch_sample),
@@ -861,32 +869,30 @@ def main():
                 prefix=patch_sample.get("prefix", ""),
                 redo=args.redo,
                 block_network=args.block_network,
-                docker_platform=(args.docker_platform or detected_platform) if args.use_local_docker else None,
+                docker_platform=args.docker_platform or detected_platform,
                 remove_image_after_eval=args.remove_image_after_eval,
-            ): patch_sample
-            for patch_sample, patch_text in valid_patches
-        }
+                skip_pull=True,  # Images already pre-fetched
+                verbose=args.verbose,
+                entryscript_timeout_seconds=args.entryscript_timeout_seconds,
+                docker_api_timeout_seconds=args.docker_api_timeout_seconds,
+            )
 
-        # Track progress with tqdm and show running accuracy
-        pbar = tqdm(concurrent.futures.as_completed(future_to_patch), total=len(valid_patches))
-        for future in pbar:
-            patch_sample = future_to_patch[future]
-            instance_id = patch_sample["instance_id"]
-            try:
-                # Get the result (if any error occurred, it will be raised here)
-                output = future.result()
-                if output is None:
-                    print(f'Evaluation for {instance_id} returned None')
-                    patch_status = "error"
-                else:
-                    raw_sample = raw_sample_df.loc[instance_id]
-                    passed_tests = {x["name"] for x in output["tests"] if x["status"] == "PASSED"}
-                    f2p = set(eval(raw_sample["fail_to_pass"]))
-                    p2p = set(eval(raw_sample["pass_to_pass"]))
-                    result = (f2p | p2p) <= passed_tests
-                    patch_status = "pass" if result else "fail"
-                    eval_results[instance_id] = result
+            if output is None:
+                cprint(f"Evaluation for {instance_id} returned None", style="yellow")
+            else:
+                raw_sample = raw_sample_df.loc[instance_id]
+                passed_tests = {x["name"] for x in output["tests"] if x["status"] == "PASSED"}
+                f2p = set(eval(raw_sample["fail_to_pass"]))
+                p2p = set(eval(raw_sample["pass_to_pass"]))
+                result = (f2p | p2p) <= passed_tests
+                patch_status = "pass" if result else "fail"
+                eval_results[instance_id] = result
+        except Exception as exc:
+            cprint(f"Evaluation for {instance_id} generated an exception: {exc}", style="red")
+            patch_status = "error"
 
+        if stats_lock is not None:
+            with stats_lock:
                 if patch_status == "error":
                     eval_results[instance_id] = False
                 patch_statuses[instance_id] = patch_status
@@ -894,28 +900,74 @@ def main():
 
                 current_accuracy = status_counts["pass"] / max(1, sum(status_counts.values()))
                 pbar.set_description(f"Accuracy: {current_accuracy:.2%}")
-            except Exception as exc:
-                print(f'Evaluation for {instance_id} generated an exception: {exc}')
+                pbar.set_postfix(status_counts)
+                pbar.update(1)
+        else:
+            if patch_status == "error":
                 eval_results[instance_id] = False
-                patch_statuses[instance_id] = "error"
-                status_counts["error"] += 1
-                # Update progress bar description with current accuracy
-                current_accuracy = status_counts["pass"] / max(1, sum(status_counts.values()))
-                pbar.set_description(f"Accuracy: {current_accuracy:.2%}")
+            patch_statuses[instance_id] = patch_status
+            status_counts[patch_status] += 1
+
+            current_accuracy = status_counts["pass"] / max(1, sum(status_counts.values()))
+            pbar.set_description(f"Accuracy: {current_accuracy:.2%}")
+            pbar.set_postfix(status_counts)
+            pbar.update(1)
+        vprint(
+            args.verbose,
+            f"[{instance_id}] Worker finished with status={patch_status} in {time.monotonic() - instance_start:.2f}s",
+        )
+
+    if args.num_workers <= 1:
+        vprint(args.verbose, "Running in serial mode (num_workers <= 1); no thread pool will be used")
+        for patch_sample, patch_text in valid_patches:
+            run_evaluation_with_progress(patch_sample, patch_text)
+    else:
+        heartbeat_seconds = max(1.0, args.heartbeat_seconds)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+            vprint(args.verbose, f"Submitting {len(valid_patches)} tasks to ThreadPoolExecutor(max_workers={args.num_workers})")
+            futures = [
+                executor.submit(run_evaluation_with_progress, patch_sample, patch_text)
+                for patch_sample, patch_text in valid_patches
+            ]
+            pending = set(futures)
+            wait_start = time.monotonic()
+            cprint(f"Heartbeat enabled: every {heartbeat_seconds:.1f}s while waiting for workers", style="cyan")
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=heartbeat_seconds,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+
+                for future in done:
+                    vprint(args.verbose, "A worker future completed")
+                    future.result()
+
+                if pending and not done:
+                    elapsed = time.monotonic() - wait_start
+                    completed = len(futures) - len(pending)
+                    cprint(
+                        f"Heartbeat: waiting on {len(pending)} workers "
+                        f"({completed}/{len(futures)} done, elapsed {elapsed:.1f}s)",
+                        style="magenta",
+                    )
+
+    pbar.close()
     report = build_run_style_report(raw_sample_df, patches_to_run, patch_statuses, eval_results)
     report_path = report_dir / f"{report_model_name}.{args.run_id}.json"
     with open(report_path, "w") as f:
         json.dump(report, f, indent=4)
     overall_accuracy = (status_counts["pass"] / len(eval_results)) if eval_results else 0.0
-    print("Overall accuracy: ", overall_accuracy)
-    print(
+    cprint(f"Overall accuracy: {overall_accuracy:.4f}", style="bold green")
+    cprint(
         "Summary: \n"
         f"pass={status_counts['pass']}, \n"
         f"fail={status_counts['fail']}, \n"
         f"error={status_counts['error']}, \n"
         f"empty={status_counts['empty']}"
     )
-    print(f"Report written to {report_path}")
+    cprint(f"Report written to {report_path}", style="green")
+    vprint(args.verbose, f"Run finished in {time.monotonic() - run_start:.2f}s")
 
 
 if __name__ == "__main__":
