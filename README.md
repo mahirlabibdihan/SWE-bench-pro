@@ -37,8 +37,17 @@ swebench = load_dataset('ScaleAI/SWE-bench_Pro', split='test')
 
 ### 1. Install Python Dependencies
 
+Use CPython 3.10 or newer. From the mini-SWE-agent repository root, install
+the evaluator and its dependencies with:
+
 ```bash
-pip install -r requirements.txt
+python -m pip install -e ".[swebenchpro]"
+```
+
+Alternatively, when working only inside this directory:
+
+```bash
+python -m pip install -r requirements.txt
 ```
 
 ### 2. Install Docker
@@ -48,20 +57,14 @@ SWE-bench Pro uses Docker for reproducible evaluations.
 Follow the instructions in the [Docker setup guide](https://docs.docker.com/engine/install/) to install Docker on your machine.
 If you're setting up on Linux, we recommend seeing the [post-installation steps](https://docs.docker.com/engine/install/linux-postinstall/) as well.
 
-### 3. Configure Modal (Recommended) (or use local docker [Beta])
+### 3. Verify Docker
+
+Verify both the Docker CLI and daemon before starting an evaluation:
 
 ```bash
-modal setup  # Follow the prompts to generate your token
+docker version
+python -c "import docker; print(docker.from_env().ping())"
 ```
-
-After running, verify your credentials in `~/.modal.toml`:
-```
-token_id = <token id>
-token_secret = <token secret>
-active = true
-```
-
-Beta: Local Docker. No additional setup needed. Use the `--use_local_docker` flag when running evaluations.
 
 ## Docker Images
 
@@ -136,15 +139,17 @@ This will create a JSON file in the format expected by the evaluation script:
 
 ### 3. Evaluate Patches
 
-Evaluate patch predictions on SWE-Bench Pro:
+Evaluate patch predictions on SWE-Bench Pro from the mini-SWE-agent repository
+root:
 
 ```bash
-python swe_bench_pro_eval.py \
-    --raw_sample_path=swe_bench_pro_full.csv \
-    --patch_path=<your_patches>.json \
-    --output_dir=<output_directory> \
-    --scripts_dir=run_scripts \
-    --num_workers=100 \
+python -m swebenchpro.run_evaluation \
+    --dataset_name=ScaleAI/SWE-bench_Pro \
+    --predictions_path=<your_patches>.json \
+    --run_id=<run_id> \
+    --report_dir=<output_directory> \
+    --scripts_dir=swebenchpro/run_scripts \
+    --num_workers=5 \
     --dockerhub_username=jefzda
 ```
 
@@ -155,8 +160,8 @@ You can test with the gold patches, which are in the HuggingFace dataset. There 
 To reproduce leaderboard results end-to-end, follow the following steps:
 
 1. Complete setup in the `SWE-agent` submodule. We recommend to use the Docker image to run the scaffold, via `just`.
-2. Run the scaffold. We have included an example for Claude Sonnet 4.5 (claude.yaml) but feel free to use any model. It also supports `vllm` for local models. Note that we recommend using the DockerHub images rather than building the Docker images from scratch. You can also execute it locally without Modal.
+2. Run the scaffold. We have included an example for Claude Sonnet 4.5 (claude.yaml) but feel free to use any model. It also supports `vllm` for local models. We recommend using the Docker Hub images rather than building the Docker images from scratch.
 3. Compile predictions with helper_code/gather_patches.py.
-4. Run the evaluation script `swe_bench_pro_eval.py` to run the evaluation script.
+4. Run the evaluator with `python -m swebenchpro.run_evaluation`.
 
 

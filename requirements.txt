@@ -2,11 +2,9 @@
 pandas>=1.5.0
 tqdm>=4.64.0
 datasets>=2.14.0
+rich>=13.0.0
 
-# Modal for cloud-based evaluation (optional if using local Docker)
-modal>=0.50.0
-
-# Docker SDK for local evaluation (optional if using Modal)
+# Docker SDK for local evaluation
 docker>=6.0.0
 
 # HuggingFace Hub for dataset management

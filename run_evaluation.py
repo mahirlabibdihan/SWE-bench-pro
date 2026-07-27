@@ -15,8 +15,7 @@ python run_evaluation.py \
     --report_dir=evaluation \
     --scripts_dir=run_scripts \
     --num_workers=5 \
-    --dockerhub_username=jefzda \
-    --use_local_docker 
+    --dockerhub_username=jefzda
 
 The dataset must have columns: instance_id, before_repo_set_cmd, selected_test_files_to_run, 
   base_commit, base_dockerfile, instance_dockerfile, fail_to_pass, pass_to_pass
@@ -421,7 +420,10 @@ def eval_with_docker(
     docker_api_timeout_seconds=120,
 ):
     if docker is None:
-        raise RuntimeError("docker SDK is not installed. Install via 'pip install docker' or run without --use_local_docker")
+        raise RuntimeError(
+            "Docker SDK is not installed. Install the evaluator dependencies with "
+            "'python -m pip install -e \".[swebenchpro]\"'."
+        )
     uid = sample["instance_id"]
     vprint(verbose, f"[{uid}] Starting eval_with_docker")
     instance_dir = get_instance_output_dir(output_dir, run_id, model_name, uid)
