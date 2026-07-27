@@ -2,7 +2,7 @@
 
 This evaluation script:
 1. Takes a Hugging Face dataset and a JSON file containing patches
-2. Pre-fetches all required Docker images serially
+2. Reuses cached Docker images or pulls each required image on demand
 3. Runs each patch in a Docker container environment using Docker Hub images
 4. Executes the tests using local run scripts and collects results
 5. Calculates overall accuracy based on test pass/fail status
@@ -47,16 +47,23 @@ from tqdm import tqdm
 from datasets import load_dataset
 from rich.console import Console
 
-from swebench.harness.docker_utils import (
+from swebenchpro.harness.constants import LOG_INSTANCE, RUN_EVALUATION_LOG_DIR
+from swebenchpro.harness.docker_build import (
+    BuildImageError,
+    build_container,
+    close_logger,
+    setup_logger,
+)
+from swebenchpro.harness.docker_utils import (
     cleanup_container,
     copy_to_container,
     exec_run_with_timeout,
     remove_image,
 )
+from swebenchpro.harness.reporting import make_run_report
+from swebenchpro.harness.test_spec import TestSpec
 from swebenchpro.helper_code.image_uri import get_dockerhub_image_uri
 
-
-RUN_EVALUATION_LOG_DIR = Path("logs/run_evaluation")
 
 console = Console()
 
@@ -234,7 +241,16 @@ def create_entryscript(sample):
 cd /app
 git reset --hard {base_commit}
 git checkout {base_commit}
-git apply -v --reject /workspace/patch.diff
+if git apply --verbose /workspace/patch.diff; then
+    echo ">>>>> Applied Patch"
+elif git apply --verbose --reject /workspace/patch.diff; then
+    echo ">>>>> Applied Patch"
+elif patch --batch --fuzz=5 -p1 -i /workspace/patch.diff; then
+    echo ">>>>> Applied Patch"
+else
+    echo ">>>>> Patch Apply Failed" >&2
+    exit 1
+fi
 {before_repo_set_cmd}
 # run test and save stdout and stderr to separate files
 bash /workspace/run_script.sh {selected_test_files_to_run} > /workspace/stdout.log 2> /workspace/stderr.log
@@ -285,10 +301,8 @@ def prepare_run(instance_dir, prefix, redo):
     if not redo and os.path.exists(output_path):
         cprint(f"Skipping {instance_dir} - output already exists", style="yellow")
         with open(output_path, "r") as f:
-            return json.load(f), output_path, tempfile.mkdtemp()
-    # Create workspace in a temporary directory instead of in logs
-    workspace_dir = tempfile.mkdtemp(prefix="swe_bench_workspace_")
-    return None, output_path, workspace_dir
+            return json.load(f), output_path
+    return None, output_path
 
 
 def write_patch_snapshot(instance_dir, prefix, patch):
@@ -389,74 +403,6 @@ def collect_outputs_local_container(container, instance_dir, uid, prefix):
 
 
 
-def preflight_pull_images_serial(
-    valid_patches,
-    raw_sample_df,
-    dockerhub_username,
-    docker_platform=None,
-    verbose=False,
-    docker_api_timeout_seconds=120,
-):
-    """
-    Pre-fetch all required Docker images serially before starting parallel execution.
-    This avoids network contention and rate-limiting issues during threaded pulls.
-    
-    Args:
-        valid_patches (list): List of (patch_sample, patch_text) tuples
-        raw_sample_df (pd.DataFrame): Dataset rows indexed by instance_id
-        dockerhub_username (str): Docker Hub username for images
-        docker_platform (str): Optional platform override (e.g., linux/amd64)
-        verbose (bool): If True, print per-image pull logs
-    """
-    unique_images = set()
-    vprint(verbose, f"Starting preflight image discovery for {len(valid_patches)} runnable patches")
-    for patch_sample, _ in valid_patches:
-        uid = patch_sample["instance_id"]
-        sample_repo = raw_sample_df.loc[uid].get("repo", "")
-        image_uri = get_dockerhub_image_uri(uid, dockerhub_username, sample_repo)
-        unique_images.add((image_uri, docker_platform))
-    
-    if not unique_images:
-        vprint(verbose, "No images to prefetch; skipping preflight pull phase")
-        return
-    
-    vprint(verbose, "Creating Docker client for preflight pulls")
-    try:
-        client = docker.from_env(timeout=int(docker_api_timeout_seconds))
-    except Exception as e:
-        cprint(f"Error creating Docker client for preflight pulls: {e}", style="red")
-        return
-    
-    cprint(f"Pre-fetching {len(unique_images)} Docker images serially...", style="cyan")
-    
-    for idx, (image_uri, platform) in enumerate(unique_images, 1):
-        try:
-            if verbose:
-                cprint(f"  [{idx}/{len(unique_images)}] Pulling {image_uri}...", end="")
-            start_time = time.monotonic()
-            if platform:
-                client.images.pull(image_uri, platform=platform)
-            else:
-                client.images.pull(image_uri)
-            if verbose:
-                cprint(" OK", style="green")
-            vprint(verbose, f"Prefetch success for {image_uri} in {time.monotonic() - start_time:.2f}s")
-        except Exception as pull_err:
-            # Try to check if image exists locally
-            try:
-                client.images.get(image_uri)
-                if verbose:
-                    cprint(" (already cached locally)", style="green")
-                vprint(verbose, f"Prefetch pull failed but local cache exists for {image_uri}")
-            except Exception:
-                if verbose:
-                    cprint(" FAILED", style="red")
-                cprint(f"  Warning: Failed to pull image {image_uri}: {pull_err}", style="yellow")
-                cprint("  Will attempt to use image during evaluation if available locally.", style="yellow")
-
-    vprint(verbose, "Completed preflight image pull phase")
-
-
 def eval_with_docker(
     patch,
     sample,
@@ -470,7 +416,6 @@ def eval_with_docker(
     block_network=False,
     docker_platform=None,
     remove_image_after_eval=False,
-    skip_pull=False,
     verbose=False,
     entryscript_timeout_seconds=1800,
     docker_api_timeout_seconds=120,
@@ -480,7 +425,7 @@ def eval_with_docker(
     uid = sample["instance_id"]
     vprint(verbose, f"[{uid}] Starting eval_with_docker")
     instance_dir = get_instance_output_dir(output_dir, run_id, model_name, uid)
-    existing_output, output_path, workspace_dir = prepare_run(instance_dir, prefix, redo)
+    existing_output, output_path = prepare_run(instance_dir, prefix, redo)
     if existing_output is not None:
         vprint(verbose, f"[{uid}] Reusing existing output from {output_path}")
         return existing_output
@@ -489,6 +434,7 @@ def eval_with_docker(
 
     container = None
     client = None
+    instance_logger = None
     dockerhub_image_uri = None
     try:
         try:
@@ -513,50 +459,24 @@ def eval_with_docker(
 
         vprint(verbose, f"[{uid}] Creating Docker client")
         client = docker.from_env(timeout=int(docker_api_timeout_seconds))
-        if not skip_pull:
-            try:
-                pull_start = time.monotonic()
-                vprint(verbose, f"[{uid}] Pulling image (skip_pull=False)")
-                if docker_platform:
-                    client.images.pull(dockerhub_image_uri, platform=docker_platform)
-                else:
-                    client.images.pull(dockerhub_image_uri)
-                vprint(verbose, f"[{uid}] Pulled image in {time.monotonic() - pull_start:.2f}s")
-            except Exception as pull_err:
-                # If pull fails, fall back to a local image if present; otherwise, fail this run
-                try:
-                    client.images.get(dockerhub_image_uri)
-                    cprint(f"Using locally available image: {dockerhub_image_uri}", style="yellow")
-                    vprint(verbose, f"[{uid}] Pull failed; local image cache is available")
-                except Exception:
-                    cprint(f"Failed to pull or find image locally for {uid}: {pull_err}", style="red")
-                    return None
-        else:
-            # Image should already be cached from preflight phase
-            try:
-                vprint(verbose, f"[{uid}] Verifying pre-fetched image exists locally")
-                client.images.get(dockerhub_image_uri)
-                vprint(verbose, f"[{uid}] Image exists locally")
-            except Exception:
-                cprint(f"Warning: Image {dockerhub_image_uri} not found locally for {uid}", style="yellow")
-                return None
+        instance_logger = setup_logger(uid, Path(instance_dir) / LOG_INSTANCE)
+        test_spec = TestSpec(
+            instance_id=uid,
+            image_name=dockerhub_image_uri,
+            platform=docker_platform or "linux/amd64",
+            environment=env_vars,
+            network_mode="none" if block_network else None,
+        )
 
-        run_kwargs = {
-            "detach": True,
-            "remove": False,
-            "entrypoint": "/bin/bash",  # Override image entrypoint
-            "command": ["-lc", "tail -f /dev/null"],
-            "environment": env_vars,
-        }
-        if block_network:
-            run_kwargs["network_mode"] = "none"
-        # Optional platform override (useful on Apple Silicon)
-        if docker_platform:
-            run_kwargs["platform"] = docker_platform
-
-        vprint(verbose, f"[{uid}] Starting container")
+        vprint(verbose, f"[{uid}] Building container from remote image")
         container_start = time.monotonic()
-        container = client.containers.run(dockerhub_image_uri, **run_kwargs)
+        container = build_container(
+            test_spec,
+            client,
+            run_id,
+            instance_logger,
+        )
+        container.start()
         vprint(verbose, f"[{uid}] Container started in {time.monotonic() - container_start:.2f}s")
 
         vprint(verbose, f"[{uid}] Uploading workspace files to container")
@@ -593,6 +513,9 @@ def eval_with_docker(
         vprint(verbose, f"[{uid}] Evaluation completed successfully")
 
         return output
+    except BuildImageError as e:
+        cprint(f"Container setup failed for {uid}: {e}", style="red")
+        return None
     except Exception as e:
         cprint(f"Error in eval_with_docker for {uid}: {repr(e)}", style="red")
         cprint(f"Error type: {type(e)}", style="red")
@@ -617,6 +540,8 @@ def eval_with_docker(
                 vprint(verbose, f"[{uid}] Image removed during cleanup")
             except Exception as e:
                 cprint(f"Warning: failed to remove Docker image {dockerhub_image_uri}: {e}", style="yellow")
+        if instance_logger is not None:
+            close_logger(instance_logger)
         vprint(verbose, f"[{uid}] Cleanup complete")
 
 
@@ -690,39 +615,6 @@ def parse_args():
         help="Timeout in seconds for Docker SDK API calls (pull/get/run/remove)",
     )
     return parser.parse_args()
-
-
-def build_run_style_report(raw_sample_df, patches_to_run, patch_statuses, eval_results):
-    """Build a summary report similar to swebench.harness.reporting.make_run_report."""
-    total_ids = set(raw_sample_df.index.tolist())
-    submitted_ids = {p.get("instance_id") for p in patches_to_run if isinstance(p, dict) and p.get("instance_id")}
-
-    completed_ids = {iid for iid, status in patch_statuses.items() if status in {"pass", "fail"}}
-    resolved_ids = {iid for iid, status in patch_statuses.items() if status == "pass"}
-    unresolved_ids = {iid for iid, status in patch_statuses.items() if status == "fail"}
-    empty_patch_ids = {iid for iid, status in patch_statuses.items() if status == "empty"}
-    error_ids = {iid for iid, status in patch_statuses.items() if status == "error"}
-    incomplete_ids = total_ids - submitted_ids
-
-    return {
-        "total_instances": len(total_ids),
-        "submitted_instances": len(submitted_ids),
-        "completed_instances": len(completed_ids),
-        "resolved_instances": len(resolved_ids),
-        "unresolved_instances": len(unresolved_ids),
-        "empty_patch_instances": len(empty_patch_ids),
-        "error_instances": len(error_ids),
-        "completed_ids": sorted(completed_ids),
-        "incomplete_ids": sorted(incomplete_ids),
-        "empty_patch_ids": sorted(empty_patch_ids),
-        "submitted_ids": sorted(submitted_ids),
-        "resolved_ids": sorted(resolved_ids),
-        "unresolved_ids": sorted(unresolved_ids),
-        "error_ids": sorted(error_ids),
-        "schema_version": 2,
-        # Keep per-instance booleans available for downstream consumers.
-        # "instance_results": eval_results,
-    }
 
 
 def main():
@@ -835,18 +727,6 @@ def main():
         except Exception:
             detected_platform = None
 
-    # Pre-fetch all Docker images serially
-    preflight_start = time.monotonic()
-    preflight_pull_images_serial(
-        valid_patches,
-        raw_sample_df,
-        args.dockerhub_username,
-        args.docker_platform or detected_platform,
-        verbose=args.verbose,
-        docker_api_timeout_seconds=args.docker_api_timeout_seconds,
-    )
-    vprint(args.verbose, f"Preflight phase finished in {time.monotonic() - preflight_start:.2f}s")
-
     # Run evaluations (serial if num_workers <= 1; threaded otherwise)
     stats_lock = threading.Lock() if args.num_workers > 1 else None
     pbar = tqdm(total=len(valid_patches), desc="Evaluation", postfix=status_counts)
@@ -871,7 +751,6 @@ def main():
                 block_network=args.block_network,
                 docker_platform=args.docker_platform or detected_platform,
                 remove_image_after_eval=args.remove_image_after_eval,
-                skip_pull=True,  # Images already pre-fetched
                 verbose=args.verbose,
                 entryscript_timeout_seconds=args.entryscript_timeout_seconds,
                 docker_api_timeout_seconds=args.docker_api_timeout_seconds,
@@ -953,7 +832,7 @@ def main():
                     )
 
     pbar.close()
-    report = build_run_style_report(raw_sample_df, patches_to_run, patch_statuses, eval_results)
+    report = make_run_report(raw_sample_df, patches_to_run, patch_statuses)
     report_path = report_dir / f"{report_model_name}.{args.run_id}.json"
     with open(report_path, "w") as f:
         json.dump(report, f, indent=4)
