@@ -230,16 +230,18 @@ def strip_binary_hunks(patch: str) -> str:
     return "".join(kept)
 
 
-def create_entryscript(sample):
+def create_entryscript(sample, clean_start=False):
     before_repo_set_cmd = sample["before_repo_set_cmd"].strip().split("\n")[-1]
     selected_test_files_to_run = ",".join(eval(sample["selected_test_files_to_run"]))
     base_commit = sample["base_commit"]
+    clean_command = "git clean -fd" if clean_start else ""
 
     entry_script = f"""
 # apply patch
 cd /app
 git reset --hard {base_commit}
 git checkout {base_commit}
+{clean_command}
 if git apply --verbose /workspace/patch.diff; then
     echo ">>>>> Applied Patch"
 elif git apply --verbose --reject /workspace/patch.diff; then
@@ -315,10 +317,10 @@ def save_runscript_to_log(instance_dir, prefix, run_script):
         f.write(run_script)
 
 
-def assemble_workspace_files(uid, scripts_dir, patch, sample):
+def assemble_workspace_files(uid, scripts_dir, patch, sample, clean_start=False):
     run_script = load_local_script(scripts_dir, uid, "run_script.sh")
     parser_script = load_local_script(scripts_dir, uid, "parser.py")
-    entryscript_content = create_entryscript(sample)
+    entryscript_content = create_entryscript(sample, clean_start=clean_start)
 
     cleaned_patch = strip_binary_hunks(patch)
     if cleaned_patch != patch:
@@ -412,6 +414,7 @@ def eval_with_docker(
     scripts_dir,
     prefix="",
     redo=False,
+    clean_start=False,
     block_network=False,
     docker_platform=None,
     remove_image_after_eval=False,
@@ -441,7 +444,13 @@ def eval_with_docker(
     try:
         try:
             vprint(verbose, f"[{uid}] Assembling workspace files from scripts dir: {scripts_dir}")
-            files, entryscript_content = assemble_workspace_files(uid, scripts_dir, patch, sample)
+            files, entryscript_content = assemble_workspace_files(
+                uid,
+                scripts_dir,
+                patch,
+                sample,
+                clean_start=clean_start,
+            )
         except FileNotFoundError as e:
             cprint(f"Error loading scripts for {uid}: {e}", style="red")
             return None
@@ -578,6 +587,13 @@ def parse_args():
     )
     parser.add_argument(
         "--redo", action="store_true", help="Redo evaluations even if output exists"
+    )
+    parser.add_argument(
+        "--clean-start",
+        "--clean_start",
+        dest="clean_start",
+        action="store_true",
+        help="Run git clean -fd before applying each patch to remove untracked files",
     )
     parser.add_argument(
         "--num_workers",
@@ -750,6 +766,7 @@ def main():
                 args.scripts_dir,
                 prefix=patch_sample.get("prefix", ""),
                 redo=args.redo,
+                clean_start=args.clean_start,
                 block_network=args.block_network,
                 docker_platform=args.docker_platform or detected_platform,
                 remove_image_after_eval=args.remove_image_after_eval,

@@ -154,6 +154,10 @@ uv run python -m swebenchpro.run_evaluation \
     --dockerhub_username=jefzda
 ```
 
+Pass `--clean-start` to run `git clean -fd` in `/app` after checking out the
+base commit and before applying each patch. This matches the standard
+SWE-bench evaluator behavior and removes stale untracked files from an image.
+
 You can test with the gold patches, which are in the HuggingFace dataset. There is a helper script in `helper_code` which can extract the gold patches into the required JSON format.
 
 ## Reproducing Leaderboard Results
