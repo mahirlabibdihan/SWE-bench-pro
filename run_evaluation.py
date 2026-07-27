@@ -8,7 +8,7 @@ This evaluation script:
 5. Calculates overall accuracy based on test pass/fail status
 
 Usage:
-python swe_bench_pro_eval.py \
+python run_evaluation.py \
     --dataset_name=ScaleAI/SWE-bench_Pro \
     --predictions_path={OUTPUT}/preds.json \
     --run_id=pro.test.01 \
