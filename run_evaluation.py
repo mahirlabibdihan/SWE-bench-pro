@@ -422,7 +422,7 @@ def eval_with_docker(
     if docker is None:
         raise RuntimeError(
             "Docker SDK is not installed. Install the evaluator dependencies with "
-            "'python -m pip install -e \".[swebenchpro]\"'."
+            "'uv sync --extra swebenchpro'."
         )
     uid = sample["instance_id"]
     vprint(verbose, f"[{uid}] Starting eval_with_docker")
