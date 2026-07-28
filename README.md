@@ -150,7 +150,7 @@ uv run python -m swebenchpro.harness.run_evaluation \
     --run_id=<run_id> \
     --report_dir=<output_directory> \
     --scripts_dir=swebenchpro/run_scripts \
-    --num_workers=10 \
+    --num_workers=4 \
     --dockerhub_username=jefzda
 ```
 

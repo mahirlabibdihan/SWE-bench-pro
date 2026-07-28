@@ -14,7 +14,7 @@ uv run python -m swebenchpro.harness.run_evaluation \
     --run_id=pro.test.01 \
     --report_dir=evaluation \
     --scripts_dir=run_scripts \
-    --num_workers=10 \
+    --num_workers=4 \
     --dockerhub_username=jefzda
 
 The dataset must have columns: instance_id, before_repo_set_cmd, selected_test_files_to_run,
@@ -598,7 +598,7 @@ def parse_args():
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=10,
+        default=4,
         help="Number of workers to run evaluations in parallel",
     )
     parser.add_argument(
