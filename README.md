@@ -158,6 +158,12 @@ Pass `--clean-start` to run `git clean -fd` in `/app` after checking out the
 base commit and before applying each patch. This matches the standard
 SWE-bench evaluator behavior and removes stale untracked files from an image.
 
+Each container is limited to 2 GB of memory by default, including swap, to
+protect the Docker host from runaway test processes. Override this for heavier
+instances with `--container-memory-limit 8g`, or disable it explicitly with
+`--container-memory-limit 0`. Total possible container memory is approximately
+the limit multiplied by `--num_workers`.
+
 You can test with the gold patches, which are in the HuggingFace dataset. There is a helper script in `helper_code` which can extract the gold patches into the required JSON format.
 
 ## Reproducing Leaderboard Results

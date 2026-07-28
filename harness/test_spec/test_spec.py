@@ -13,6 +13,7 @@ class TestSpec:
     command: list[str] | str = field(default_factory=lambda: ["-lc", "tail -f /dev/null"])
     environment: dict[str, str] = field(default_factory=dict)
     network_mode: str | None = None
+    memory_limit: str | int | None = None
 
     @property
     def instance_image_key(self) -> str:

@@ -417,6 +417,7 @@ def eval_with_docker(
     clean_start=False,
     block_network=False,
     docker_platform=None,
+    container_memory_limit="2g",
     remove_image_after_eval=False,
     verbose=False,
     entryscript_timeout_seconds=1800,
@@ -477,6 +478,7 @@ def eval_with_docker(
             platform=docker_platform or "linux/amd64",
             environment=env_vars,
             network_mode="none" if block_network else None,
+            memory_limit=container_memory_limit or None,
         )
 
         vprint(verbose, f"[{uid}] Building container from remote image")
@@ -603,6 +605,13 @@ def parse_args():
     )
     parser.add_argument(
         "--block_network", action="store_true", help="Block network access inside container"
+    )
+    parser.add_argument(
+        "--container-memory-limit",
+        "--container_memory_limit",
+        dest="container_memory_limit",
+        default="2g",
+        help="Docker memory limit per container (for example 2g or 4096m); use 0 to disable",
     )
     parser.add_argument(
         "--remove_image_after_eval",
@@ -769,6 +778,11 @@ def main():
                 clean_start=args.clean_start,
                 block_network=args.block_network,
                 docker_platform=args.docker_platform or detected_platform,
+                container_memory_limit=(
+                    None
+                    if str(args.container_memory_limit).strip().lower() in {"0", "none", "unlimited"}
+                    else args.container_memory_limit
+                ),
                 remove_image_after_eval=args.remove_image_after_eval,
                 verbose=args.verbose,
                 entryscript_timeout_seconds=args.entryscript_timeout_seconds,

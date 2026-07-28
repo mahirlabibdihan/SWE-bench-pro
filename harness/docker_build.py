@@ -84,6 +84,9 @@ def build_container(
         }
         if test_spec.network_mode:
             create_kwargs["network_mode"] = test_spec.network_mode
+        if test_spec.memory_limit:
+            create_kwargs["mem_limit"] = test_spec.memory_limit
+            create_kwargs["memswap_limit"] = test_spec.memory_limit
         container = client.containers.create(**create_kwargs)
         return container
     except Exception as exc:

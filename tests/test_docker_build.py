@@ -48,3 +48,17 @@ def test_build_container_requires_prefetched_image_when_pull_disabled():
 
     with pytest.raises(BuildImageError):
         build_container(_spec(), client, "run-1", Mock(), pull_image=False)
+
+
+def test_build_container_applies_memory_and_swap_limits():
+    client = Mock()
+    container = Mock()
+    spec = _spec()
+    spec.memory_limit = "2g"
+    client.containers.create.return_value = container
+
+    build_container(spec, client, "run-1", Mock())
+
+    create_kwargs = client.containers.create.call_args.kwargs
+    assert create_kwargs["mem_limit"] == "2g"
+    assert create_kwargs["memswap_limit"] == "2g"
