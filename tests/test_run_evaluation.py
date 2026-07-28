@@ -1,4 +1,4 @@
-from swebenchpro.run_evaluation import create_entryscript
+from swebenchpro.harness.run_evaluation import create_entryscript
 
 
 def _sample():

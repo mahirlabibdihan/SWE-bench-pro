@@ -144,13 +144,13 @@ Evaluate patch predictions on SWE-Bench Pro from the mini-SWE-agent repository
 root:
 
 ```bash
-uv run python -m swebenchpro.run_evaluation \
+uv run python -m swebenchpro.harness.run_evaluation \
     --dataset_name=ScaleAI/SWE-bench_Pro \
     --predictions_path=<your_patches>.json \
     --run_id=<run_id> \
     --report_dir=<output_directory> \
     --scripts_dir=swebenchpro/run_scripts \
-    --num_workers=5 \
+    --num_workers=10 \
     --dockerhub_username=jefzda
 ```
 
@@ -167,6 +167,6 @@ To reproduce leaderboard results end-to-end, follow the following steps:
 1. Complete setup in the `SWE-agent` submodule. We recommend to use the Docker image to run the scaffold, via `just`.
 2. Run the scaffold. We have included an example for Claude Sonnet 4.5 (claude.yaml) but feel free to use any model. It also supports `vllm` for local models. We recommend using the Docker Hub images rather than building the Docker images from scratch.
 3. Compile predictions with helper_code/gather_patches.py.
-4. Run the evaluator with `uv run python -m swebenchpro.run_evaluation`.
+4. Run the evaluator with `uv run python -m swebenchpro.harness.run_evaluation`.
 
 
